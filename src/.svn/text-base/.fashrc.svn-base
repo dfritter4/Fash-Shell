@@ -1,5 +1,0 @@
-COM_HIST=500
-NAV_HIST=500
-alias ls="ls --color=auto"
-alias hello="echo hello"
-
