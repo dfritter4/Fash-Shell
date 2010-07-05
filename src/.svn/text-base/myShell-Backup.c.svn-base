@@ -1,0 +1,1044 @@
+/*******************************************
+ * Author: David Fritz
+ * 
+ * Purpose: This program attempts to create
+ *		a very basic shell similar to the UNIX/Linux
+ *		BASH. 
+ *
+ * Date: 03/18/10
+ *
+ * Statement: All of this is my own work. 
+ *
+*********************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+#include <termios.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "uthash.h"
+
+extern int errno; //error number from errno.h
+
+static char *PROMPT = "$ "; //shell prompt
+static char *args[100]; //command arguments
+static char *path; //current working path
+static int sigintCheck; //stupid global to check if a sigint was handled
+//circular linked list implementation for history
+struct HistoryList {
+	char *data; //string of the command
+	struct HistoryList *next; //pointer to next node in HistoryList
+	struct HistoryList *prev; //pointer to previous node
+};
+struct HistoryList *historyHead = NULL; //head (first node) for history
+static int historyMax = 500; //this is the default maximum # of history items
+static int historyInd = 0; //history index (total)
+struct HistoryList *curHistory = NULL; //current history node
+static struct termios old_tty_attr; //a copy of the old termios struct
+struct Alias_Table {
+	char aliasName[100]; //the name of the alias
+	char aliasValue[100]; //the value of the alias
+	UT_hash_handle hh; //necessary for hash table
+};
+static struct Alias_Table *alias_hash_table = NULL; //the hash_table of aliases
+
+/********
+ * begin function prototypes
+ ********/
+static void tty_raw_mode(void); 
+typedef void (*sighandler_t)(int); //prototype from linux man page "signal"
+static void quit_raw_mode(void);
+static void handle_sig(int);
+static void parse_args(char*);
+static void execute(char*);
+static void clear_args(void);
+static void get_path(void);
+static int check_builtin(char*);
+static void add_history(char*);
+static char* prev_history(void);
+static char* next_history(void);
+static void clear_line(int);
+static void backspace(void);
+static void print_history(void);
+static void exec_history(char*);
+static void read_config(void);
+static void add_alias(char*);
+static void check_alias(char*);
+static void check_redir(void);
+static void remove_alias(char*);
+static void print_aliases(void);
+/********
+ * end function prototypes
+ ********/
+
+void read_config(void)
+{
+	/* Arguments: none
+	
+		Purpose: looks for a file called ".fritzbashrc"
+					  in the current directory and reads it
+					  
+					  in the file can be aliases and environment
+					  variables that can be used to set specific
+					  variables inside this bash
+					  
+		Environment variables this will currently recognize:
+			COM_HIST = sets the historyMax
+			PROMPT = sets the PROMP variable
+			
+
+	*/
+	FILE *fp;
+	char *tok;
+	char *tok2;
+	char *eq = "=";
+	char *spc = " ";
+	char *line = (char*)malloc(sizeof(char)*128);
+	char *lineCpy = (char*)malloc(sizeof(char)*128);
+	fp = fopen(".fritzbashrc","r");
+	if(fp != NULL) {
+		while(fgets(line, 128, fp) != NULL) {
+			strcpy(lineCpy, line); //copy the line, because strtok fucks it up
+			tok = strtok(line,eq);
+			tok2 = strstr(lineCpy,"alias");
+			if(tok2 != NULL) {tok2[5] = '\0'; }
+			if(tok != NULL && tok2 == NULL) {
+				//there was an equal sign in this line
+				//tok SHOULD be an environ var or alias
+				if(!strcmp(tok,"COM_HIST")) {
+					//trying to set com_hist					
+					tok = strtok(NULL,eq); //tok now equals the number
+					tok[strlen(tok)-1] = '\0'; //replace newline
+					if(tok != NULL) {
+						int x;
+						x = atoi(tok); //convert to int
+						if(x > 0) { historyMax = x; } //set var
+					}
+				}
+				else if(!strcmp(tok,"PROMPT")) {
+					//setting prompt
+					tok = strtok(NULL,eq);
+					tok[strlen(tok)-1] = '\0';
+					if(tok != NULL) {
+						memset(PROMPT,0,100); //clear old prompt
+						strncpy(PROMPT, tok, strlen(tok)); //set new prompt
+					}
+				}
+			}
+			if(tok2 != NULL) {
+				//setting an alias
+				tok2 = tok2+6;
+				add_alias(tok2);
+			}
+		}
+	}
+	fclose(fp); //cleanup
+	free(line);
+	free(lineCpy);
+}
+
+void tty_raw_mode(void)
+{
+	/* Arguments: none
+	
+		Purpose: sets the terminal into raw mode
+			credit to http://www.cs.purdue.edu for code
+			
+			check "man termios" for a lot of the prototypes
+			and descriptions of structures in termios
+			
+			see also:
+			http://unixwiz.net/techtips/termios-vmin-vtime.html
+			
+			c_lflag = local modes
+			c_cc = control chacaters
+			
+			ICANON = canonical input
+			ECHO = enables echo (prints input when typed)
+			
+			VMIN and VTIME specify when the read() call returns
+			in our case VMIN = 1 and VTIME = 0
+			which means that read() will only return
+			when 1 character has been put in the caller's
+			buffer and will return immediately (no timing involved) 
+
+	*/
+	struct termios tty_attr;
+     
+	tcgetattr(0,&tty_attr);
+	tcgetattr(0,&old_tty_attr); //save old one
+	/* Set raw mode. */
+	tty_attr.c_lflag &= (~(ICANON|ECHO)); //turns off canonical mode and echo
+	tty_attr.c_cc[VTIME] = 0;
+	tty_attr.c_cc[VMIN] = 1; //wait for 1 character of input
+     
+	tcsetattr(0,TCSANOW,&tty_attr); //set these new attributes
+}
+
+void quit_raw_mode(void)
+{
+	/* Arguments: none
+	
+		Purpose: sets the terminal into canonical mode
+					  similar to tty_raw_mode() but changes
+					  the flags to quit raw mode instead of 
+					  entering it
+	*/	
+	tcsetattr(0,TCSANOW,&old_tty_attr); //set attributes back to old struct
+}
+
+void handle_sig(int sigNo)
+{
+	/* Arguments:
+			*sigNo --- signal number of the interrupt signal
+		
+		Purpose:
+			handles the SIGINT signal specifically
+	*/
+	printf("\nTermination interrupted!\n%s:%s",path,PROMPT);
+	fflush(stdout); //flush standard ouput buffer
+	sigintCheck = 1; //we handled this SIGINT
+}
+
+void parse_args(char *line)
+{
+	/* Arguments:
+			*line --- string of the command w/ args
+		
+		Purpose:
+			this function takes a string and parses it into 
+			an array of arguments stored in global args
+	*/
+	char *linecpy = line;
+	char indArg[100]; //individual argument
+	memset(indArg,0,100); //needed to clear out the crap
+	int i = 0;
+	int insideQuote = 0; //boolean to treat stuff in quotes as 1 arg
+	
+	while(*linecpy != '\0') { //loop until end of string
+		if(*linecpy == '\"') { insideQuote = 1-insideQuote;}
+		if(*linecpy == ' ' && !insideQuote) { //a space in line = new arg
+			if(strlen(indArg) != 0) {
+				args[i] = (char *)malloc(sizeof(char) * strlen(indArg) + 1);
+				memset(args[i],0,strlen(indArg)+1);
+				strncpy(args[i], indArg, strlen(indArg)); //copy 
+				strncat(args[i], "\0", 1); //add the null terminator
+				memset(indArg, 0, 100); //reset the indArg array
+				++i;
+			}
+		}
+		else {
+			strncat(indArg, linecpy, 1); //build up indArg with next char
+		}
+		++linecpy;
+	}
+	args[i] = (char *)malloc(sizeof(char) * strlen(indArg) +1); //last arg malloc
+	memset(args[i],0,strlen(indArg)+1);
+	strncpy(args[i], indArg, strlen(indArg)); //add the last arg
+	strncat(args[i], "\0", 1); //add null terminator
+	//free(indArg);
+}
+
+void check_alias(char* cmd)
+{
+	/* Arguments:
+			*cmd --- the command to check for aliases
+		
+		Purpose:
+			looks for aliases to cmd and if it finds one,
+			replaces cmd (arg[0]) and adds any arguments
+			to the argument list
+	*/
+	struct Alias_Table *s;
+	HASH_FIND_STR(alias_hash_table, cmd, s);
+	if(s!= NULL) {
+		//an alias exists for that command
+		char *line = (char*)malloc(sizeof(char)*100);
+		memset(line,0,100);
+		strcat(line,s->aliasValue); 
+		char *arg = args[1];
+		int i = 2;
+		//we are going to build up a new string
+		//to parse with the replaced alias
+		while(arg != NULL) {
+			strcat(line, " ");
+			strcat(line,arg);
+			arg = args[i];
+			++i;
+		}
+		clear_args(); //clear old args
+		parse_args(line); //reparse this line
+		free(line); //cleanup
+	}	
+}
+
+void check_redir(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			analyzes args for possible redirection and handles
+			any if found.
+			
+			this will be called after a fork()	but before an execvp() 
+			so that fritzbash's file descriptors are unchanged
+	*/
+	int i =1;
+	char *arg = (char*)malloc(sizeof(char)*100);
+	char *fName = (char*)malloc(sizeof(char) * 100);
+	memset(fName,0,100);
+	memset(arg,0,100);
+	//char *pArg;
+	arg = args[i];
+	//pArg = arg;
+	while(arg != NULL) {
+		//lets check  all the cases
+		if(arg[0] == '>' && arg[1] == ' ') {
+			//redirecting stdout to file, creating new file
+			//if doesnt exist, or overwriting an old file
+			//also, this is the case that is followed by a space
+			//so the next args is the fName			
+		} else if(arg[0] == '>' && (arg[1] >= 65 && arg[1] >= 90) || (arg[1] >= 97 && arg[1] <= 122)) {
+			//redirecting stdout to file, creating new file
+			//if doesnt exist, or overwriting an old file
+			//also, this is the case that is followed by a
+			//letter, so the fName is this arg+1
+		} else if(arg[0] == '>' && arg[1] == '>' && arg[2] == ' ') {
+			//redirecting stdout to file, creating new file
+			//if doesnt exist, or appending to file, if it does
+			//also, this is the case that is followed by a space
+			//so the next args is the fName
+		} else if(arg[0] == '>' && arg[1] == '>' && (arg[2] >= 65 && arg[2] >= 90) || (arg[2] >= 97 && arg[2]<= 122)) {
+			//redirecting stdout to file, creating new file
+			//if doesnt exist, or appending to file, if it does
+			//also, this is the case that is followed by a letter
+			//so arg+1 is the fName
+		} else if(
+		else if(arg[0] == '<') {
+			//redirect stdin
+			
+		}
+		++i;
+		arg = args[i];
+	}
+}
+
+void execute(char *cmd)
+{
+	/* Arguments:
+			*cmd --- the program to run
+		
+		Purpose:
+			this function takes a string and forks off
+			a new process with the global args array
+			
+			this will first check to see if aliases exist for 
+			the command. check_alias will deal with 
+			changing arg[0] if an alias exists, so always
+			call execvp with arg[0] (instead of cmd arg) in
+			case check_alias changes the cmd
+			
+			it will then check to see if the cmd is a built in
+			command. if it is, then this doesnt fork any process
+	*/
+	int i;
+	check_alias(cmd);
+	i = check_builtin(args[0]);
+	if(!i) { return;} //cmd was a built in (like "cd")
+	if(fork() == 0) {
+		//check redirections
+		//check_redir();
+		i = execvp(args[0], args); //using execvp to avoid PATH crap
+		if(i < 0) {
+			printf("-fritzbash: %s: command not found\n", cmd); //error, we'll just say not found
+			exit(1);
+		}
+	}
+	else { wait(NULL); }
+}
+
+void clear_args(void)
+{	
+	/* Arguments:
+			none
+		
+		Purpose:
+			this function clears the global args array
+			of any arguments
+	*/
+	int i;
+	for(i=0;args[i]!=NULL;++i) {
+		memset(args[i],0,strlen(args[i])+1); //clear arg string
+		args[i] = NULL; //nullify pointer
+		free(args[i]); //free array block
+	}
+}
+
+void get_path(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			this function is probably a HELL of a lot more
+			work than necessary, but i couldn't find any
+			Linux functions to do this
+			
+			essentially, this will get the current working path
+			and set our global path variable to ONLY the 
+			top two directories (current directory and one up)
+			so that the path doesnt ever get too long
+	*/
+	long size;
+	char *pathbuf;
+	size = pathconf(".", _PC_PATH_MAX);
+	pathbuf = (char *)malloc((size_t)size); //buffer for working path
+	path = getcwd(pathbuf,(size_t)size); //getcwd gets current working path
+	char *tmpPath = (char*)malloc(sizeof(char)*100);
+	strcpy(tmpPath,path); //going to loop through path
+	char *newPath = (char *)malloc(sizeof(char) * 100); //build a new path
+	memset(newPath,0,100);
+	char *pTmpPath = tmpPath;
+	while(*tmpPath != '\0') { ++tmpPath; } //gets to end of string
+	--tmpPath; //step back 1
+	int i=0;
+	
+	//this while loop gets the top 2 directories
+	//built in reverse
+	int slashNo = 0;
+	while(*tmpPath != '/' && *tmpPath != '\0') {
+		*(newPath+i) = *tmpPath;
+		--tmpPath;
+		++i;
+		if(*tmpPath == '/' && ++slashNo == 1) {
+			*(newPath+i) = '/'; //adds the slash
+			++i;
+			--tmpPath;
+		}
+	}
+	
+	//now reverse our string
+	int end = strlen(newPath)-1;
+	i = 0;
+	while(i<end) {
+		*(newPath+i) ^= *(newPath+end);
+		*(newPath+end) ^= *(newPath+i);
+		*(newPath+i) ^= *(newPath+end);
+		++i;
+		--end;
+	} //you know that in-place reversal algorithm was badass
+
+	//free(path);
+	path = (char*)malloc(sizeof(char)*strlen(newPath));
+	strcpy(path,newPath); //set path to new 2 directory long path
+	free(pathbuf);
+	free(pTmpPath);
+	free(newPath);
+}
+
+void add_alias(char* aName)
+{
+	/* Arguments:
+			aName = name/value of the alias to add
+		
+		Purpose:
+			takes in an a string in the format of
+				command=alias for command
+			and creates an alias for it
+			
+			if format of command is:
+				alias ls
+			will list the alias for "ls" if exists
+			or specify if not
+	*/
+	struct Alias_Table *s;
+	struct Alias_Table *f;
+	
+	char *tok;
+	char *eq = "=";
+	char *nameCopy = (char*)malloc(sizeof(char) *100);
+	char *name = (char*)malloc(sizeof(char) * 100);
+	char *value = (char*)malloc(sizeof(char) * 100);
+	char *pNameCopy;
+	memset(nameCopy,0,100);
+	memset(name,0,100);
+	memset(value,0,100);
+	strcpy(nameCopy, aName);
+	tok = strstr(aName,eq);
+	if(tok != NULL) {
+		tok = strtok(aName,eq);
+		//there was an = sign, so they had something
+		strcpy(name,tok); //name is now the name of the alias
+		f = (struct Alias_Table*)malloc(sizeof(struct Alias_Table));
+		HASH_FIND_STR(alias_hash_table,name,f);
+		if(f != NULL) {
+			//name was already in the hash table, so we need
+			//to delete it
+			HASH_DEL(alias_hash_table, f); //deletes old alias
+		}
+		pNameCopy = nameCopy; //keep track of the this so we can free it later
+		nameCopy += strlen(tok)+1; //nameCopy now equals the value, yay pointers
+		
+		//we need to remove the quotation mark characters (-2 because of newline)
+		//this assumes (probably unsafely) that if it starts with a quotation mark, it
+		//ends with one
+		if(nameCopy[0] == '"') { nameCopy += 1; nameCopy[strlen(nameCopy)-2] = '\0'; }
+		
+		if(nameCopy != NULL) {			
+			//we actually have a value
+			strcpy(value,nameCopy); //value is now alias' value
+			s = (struct Alias_Table*)malloc(sizeof(struct Alias_Table));
+			strcpy(s->aliasName, name);
+			strcpy(s->aliasValue, value);
+			HASH_ADD_STR(alias_hash_table,aliasName,s); //add to hash table
+			free(pNameCopy);
+			free(name);
+			free(value);
+			return;
+		}
+		free(f);
+	}
+	//there was no '=' sign, so they wanted to print
+	//the alias if it exists, or issue a message if it doesnt
+	HASH_FIND_STR(alias_hash_table, aName, s);
+	char *tmp = (char*)malloc(sizeof(char) *100);
+	memset(tmp,0,100);
+	if(s == NULL) {
+		//they wanted to print an alias that doesnt exist		
+		sprintf(tmp,"fritzbash: alias: %s: not found\n",aName);
+		write(1,tmp,strlen(tmp));
+	} else {
+		//print out its value
+		sprintf(tmp, "alias %s='%s'\n",s->aliasName,s->aliasValue);
+		write(1,tmp,strlen(tmp));
+	}
+	//cleanup
+	free(tmp);
+	free(nameCopy);
+	free(name);
+	free(value);
+	free(s);
+}
+
+void remove_alias(char* aName)
+{
+	/* Arguments:
+			aName = name/value of the alias to remove
+		
+		Purpose:
+			searches for alias called "aName" and
+			removes it if it exists, or specifies that there
+			wasn't one
+			
+			if aName == "-a", remove all aliases
+	*/
+	if(aName	 == NULL) {
+		//they didnt provide a name to unalias
+		//so issue a usage statement
+		char *tmp = (char*)malloc(sizeof(char)*100);
+		memset(tmp,0,100);
+		sprintf(tmp,"unalias: usage: unalias [-a] name [name ...]\n");
+		write(1,tmp,strlen(tmp));
+		free(tmp);
+		return;
+	} else if(!strcmp(aName,"-a")) {
+		//asking to remove all
+		struct Alias_Table *s;
+		while(alias_hash_table) {
+			s = alias_hash_table;
+			HASH_DEL(alias_hash_table,s);
+			free(s);
+		} return;
+	} else {
+		//they provided a name (or multiple) so
+		//lets see if we can find them and remove them
+		//if they exist, or print something if we didnt find them
+		char *arg = args[1];
+		int i=2;
+		struct Alias_Table *s;
+		char *tmp = (char*)malloc(sizeof(char)*100);
+		memset(tmp,0,100);
+		while(arg != NULL) {
+			HASH_FIND_STR(alias_hash_table, arg, s);
+			if(s == NULL) {
+				//they requested something that wasnt in the alias table
+				sprintf(tmp, "fritzbash: unalias: %s: not found\n",arg);
+				write(1,tmp,strlen(tmp));
+				memset(tmp,0,100);
+			} else {
+				//we did find something, so lets delete it
+				HASH_DEL(alias_hash_table, s);
+				free(s);
+			}
+			arg = args[i];
+			++i;
+		}
+		free(tmp);
+	}
+}
+
+void print_aliases(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			prints all aliases
+	*/
+	struct Alias_Table *s;
+	s = alias_hash_table;
+	if(s == NULL) {return;}
+	char *tmp = (char*)malloc(sizeof(char) * 100);
+	memset(tmp,0,100);
+	for(;s!=NULL;s=s->hh.next) {
+		sprintf(tmp, "alias %s='%s'\n",s->aliasName,s->aliasValue);
+		write(1,tmp,strlen(tmp));
+	}
+	free(tmp);
+}
+
+int check_builtin(char *cmd)
+{
+	/* Arguments:
+			cmd = program to run
+			
+		Purpose:
+			this function checks to see if the 
+			cmd specified is a built in command
+			(in this case only "cd" is built-in)
+		
+		Returns:
+			0  -- if the cmd is built in
+			-1 -- if the cmd is NOT built in
+	*/
+
+	if(!strcmp(cmd,"cd")) {
+		//command was "cd" which is a builtin, so
+		//lets handle it
+		chdir(args[1]); //change directory to first argument
+		get_path(); //get current path
+	}
+	else if(cmd[0] == '!') {
+		//theyre requesting some sort of history
+		exec_history(cmd); //execute the argument number 
+		return 0; //we took care of it
+	}
+	else if(!strcmp(cmd,"history")) {
+		print_history();
+	}
+	else if(!strcmp(cmd,"alias")) {
+		//trying to set an alias
+		if(args[1] == NULL) {
+			//no argument, so just print all
+			print_aliases();
+		} else {
+			add_alias(args[1]);
+		}
+	}
+	else if(!strcmp(cmd,"unalias")) {
+		//trying to remove an alias (args[1] is what is being removed)
+		remove_alias(args[1]);
+	}
+	else { return -1; }
+	return 0;
+}
+
+void exec_history(char* cmd)
+{
+	/* Arguments:
+			cmd = ![number]
+		
+		Purpose:
+			executes the command in history
+			specified by the # in history 
+			
+			Example:
+				!13 -- executes history #13 if
+					it exists
+				
+				! -- executes the last command
+	*/
+	++cmd; //removes ! char
+	int hisNum = atoi(cmd); //converts string number to int
+	if(hisNum == 0) { 
+		hisNum = historyInd; //hisNum == 0 means no argument, so run most recent
+	}
+	char *tmp = (char*)malloc(sizeof(char) * 100);
+	if(hisNum > historyInd || hisNum < 0) { 
+		//if they request a negative command or one that
+		// "hasn't" happened yet
+		char *tmp = (char*)malloc(sizeof(char) * 40);
+		sprintf(tmp, "-fritzbash: !%i: event not found\n", hisNum);
+		write(1,tmp,strlen(tmp));
+		free(tmp);
+	} else {			
+		if(hisNum <= (int)(historyInd/2)) {
+			//go forward through linked list
+			int x = 0;
+			struct HistoryList *cur = historyHead; 
+			for(;x<hisNum-1;++x) {
+				cur = cur->next;	//next node			
+			}
+			strncpy(tmp,cur->data,strlen(cur->data)); //copy command
+		} else {
+			//go backward through linked list
+			int x = 0;
+			int y = historyInd-hisNum;
+			struct HistoryList *cur = historyHead->prev; //start at end
+			for(;x<y;++x) {
+				cur = cur->prev; //go back
+			}
+			strncpy(tmp,cur->data,strlen(cur->data)); //copy command		
+		}
+		//now prepare to send to execute
+		char *tmp2 = (char*)malloc(sizeof(char) * 100);
+		sprintf(tmp2,"%s\n",tmp); //print the command they chose
+		write(1,tmp2,strlen(tmp2));
+		clear_args(); //clear all old arguments
+		parse_args(tmp); //repearse this old command
+		add_history(tmp); //this is what goes into history
+		execute(args[0]); //arg[0] is the command itself
+		free(tmp);
+	}
+	
+}
+
+void add_history(char *line)
+{
+	/* Arguments:
+			line = line to add to bash history
+		
+		Purpose:
+			keeps a history of bash commands
+			for the user to feel more like standard bash
+			
+			this implements a circularly linked list for
+			the history items
+	*/
+	struct HistoryList *temp = (struct HistoryList*)malloc(sizeof(struct HistoryList));
+	//curHistory will be a new special node that has no data, has no
+	//next, but prev points to the previous node (in this case the head)
+	curHistory = (struct HistoryList*)malloc(sizeof(struct HistoryList)); 
+	curHistory->data = NULL;
+	curHistory->next = NULL;
+	
+	if(historyHead == NULL) { //special case if the list is empty
+		temp->data = (char*)malloc(sizeof(char) * 100); //allocate space
+		memset(temp->data,0,100);
+		strncpy(temp->data,line,strlen(line)); //put the command into the data member
+		temp->next = NULL; //there isnt a next yet
+		temp->prev = temp; //previous points to itself? wow...
+		historyHead = temp; //this 1st node is the head
+		historyHead->next = curHistory;
+		curHistory->prev = historyHead;
+	}
+	else {
+		temp = historyHead;
+		while(temp->next != NULL) {
+			temp = temp->next;
+		}
+		temp = temp->prev;
+		struct HistoryList *temp2 = (struct HistoryList*)malloc(sizeof(struct HistoryList));
+		temp2->data = (char *)malloc(sizeof(char) * 100);
+		memset(temp2->data,0,100);
+		strncpy(temp2->data,line,strlen(line));
+		temp2->next = curHistory;
+		temp2->prev = temp;
+		temp->next = temp2;
+		historyHead->prev = temp2;
+		curHistory->prev = temp2;
+	}	
+	++historyInd;
+	if (historyInd > historyMax) {
+		//this command is past the historyMax
+		//so we need to add this new command
+		//and cut off the hold one
+		struct HistoryList *tmp = historyHead->prev;
+		historyHead = historyHead->next;
+		historyHead->prev = tmp;
+	}
+}
+
+char* prev_history(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			prints to the line the last command in
+			history or returns 0 if none
+		
+		Returns:
+			char* string of last command (if exists) or 0
+	*/
+	if(curHistory == NULL) {return 0;} //get trivial case	
+	if(curHistory != historyHead) {
+		curHistory = curHistory->prev;
+	}
+	char *tmp = (char*)malloc(sizeof(char)*100);
+	memset(tmp,0,100);
+	strncpy(tmp, curHistory->data, strlen(curHistory->data));
+	return tmp;
+}
+
+char* next_history(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			prints to the line the next command in
+			history (if we've gone back a few)
+		
+		Returns:
+			char* string of next command (if exists) or 0 if no next history
+	*/
+	if(curHistory == NULL) {return 0;}
+	if(curHistory->next == NULL){return 0;}	
+	if(curHistory->next->data != NULL) {
+		curHistory = curHistory->next;
+	} else {curHistory = curHistory->next; return 0;}
+	char *tmp = (char*)malloc(sizeof(char)*100);
+	memset(tmp,0,100);
+	strncpy(tmp, curHistory->data, strlen(curHistory->data));
+	return tmp;
+}
+
+void print_history(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			prints to screen an indexed listing
+			of the history of comands just like
+			in bash
+	*/
+	int x = 0;
+	struct HistoryList *temp;
+	temp = historyHead;
+	if(temp == NULL) { printf("No history.\n"); }
+	else {
+		while(temp != NULL && temp->data != NULL) {
+			printf("  %i    %s\n",x+1,temp->data);
+			++x;
+			temp = temp->next;
+		}
+	}
+}
+
+void clear_line(int len)
+{
+	/* Arguments:
+			len = # of characters to backspace
+		
+		Purpose:
+			deletes from stdin number of positions
+			back as per len argument
+	*/
+	char c;
+	int x = len;
+	while(x){
+		c = 8;
+		write(1,&c,1);
+		--x;
+	}
+	x = len;
+	while(x) {
+		c = ' ';
+		write(1,&c,1);
+		--x;
+	}
+	x = len;
+	while(x) {
+		c = 8;
+		write(1,&c,1);
+		--x;
+	}
+}
+
+void backspace(void)
+{
+	/* Arguments:
+			none
+		
+		Purpose:
+			deletes one character back
+			(essentially clear_line(1))
+			but (barely) faster
+	*/
+	char c;
+	c = 8;
+	write(1,&c,1);
+	c = ' ';
+	write(1,&c,1);
+	c = 8;
+	write(1,&c,1);
+}
+
+int main(int argc, char *argv[], char *envp[])
+{
+	read_config(); //read the config file
+	char c; //reading one letter at time here
+	char *line = (char *)malloc(sizeof(char) * 100); //building a command line 
+																		//which will eventually get parsed
+	memset(line,0,100);
+	char *cmd = (char *)malloc(sizeof(char) * 100); //the program (command w/o args)
+	char *printBuff = (char *)malloc(sizeof(char)*100); //a printing buffer (for use with raw tty)
+	char *historyHold = (char *)malloc(sizeof(char)*100); /*holder for history if stuff is typed, then 
+																				history is used to go back to typed stuff*/
+	memset(printBuff,0,100);
+	memset(historyHold,0,100);
+	memset(cmd,0,100);
+	signal(SIGINT, handle_sig); //register interrupt signal (for CTRL+C)
+	int promptLen, curPos; //making sure we dont backspace the prompt
+	int fromHistory = 0; //a type of check to see if our line is from history (not user typed)
+	
+	if(fork() == 0) {
+		execve("/usr/bin/clear", argv, envp); //simply clear the screen
+		exit(1);
+	}
+	else {
+		wait(NULL); //wait to clear screen
+	}
+	get_path(); //gets the 2dir path for prompt
+	tty_raw_mode();//set terminal into raw mode	
+	sprintf(printBuff,"%s:%s",path,PROMPT); //build print buff
+	promptLen = strnlen(printBuff);
+	curPos = promptLen; //leave a space
+	write(1,printBuff,promptLen); //print initial prompt
+	memset(printBuff,0,100); //clear printBuff
+	clear_args(); //just get any initial crap out
+	
+	/* MAIN LOOP */
+	while(1) {
+		read(0,&c,1); //read 1 character from stdin
+		if(c >32 || c == 10 || c ==32) { 
+			//here, we only want to process characters that are
+			//"readable" (or enter). special characters will be
+			//handled differently
+			write(1,&c,1); //write char (echo is off for raw mode)
+			++curPos;
+			switch(c) {
+				case '\n': //end of the line (enter was pressed after input)
+					if(line[0] == '\0') { 
+						//they didnt type anything
+						sprintf(printBuff,"%s:%s",path,PROMPT);
+						write(1,printBuff,promptLen); 
+					} 
+					else if(strcmp(line,"exit")==0) {
+						printf("\n"); //for niceness
+						quit_raw_mode(); //play nice and restore term state
+						return 0; //quit if they type "exit"
+					}
+					else { //prepare to actually process						
+						strncat(line,"\0",1);
+						if(line[0] != '!') {
+							add_history(line); //add command to history
+						}
+						parse_args(line); //build array of arguments
+						strncpy(cmd, args[0], strlen(args[0])); //cmd = program to run
+						execute(cmd); //try to execute the command
+						clear_args(); //resets all arg array strings
+						memset(cmd, 0, 100); //clear the cmd array
+						get_path();
+						if(sigintCheck){sigintCheck=0; }
+						else { 
+							//reprint prompt
+							sprintf(printBuff,"%s:%s",path,PROMPT);
+							promptLen = strnlen(printBuff);
+							curPos = promptLen;
+							write(1,printBuff,promptLen);						
+						} 
+					}
+					memset(line,0,100); //clear line array
+					memset(historyHold,0,100);//clear history hold
+					break;
+				default: strncat(line, &c, 1);//build the line
+					break;
+			}
+		}
+		else if(c == 8) {
+			//backspace pressed
+			if(curPos > promptLen) {
+				backspace(); //backspace until we reach prompt
+				line[strnlen(line)-1] = 0; //thank god this finally works
+				--curPos;
+			}
+		}
+		else if(c == 27) {
+			//the user pressed some sort of
+			//escape sequence
+			char c1;
+			char c2;
+			read(0,&c1,1);
+			read(0,&c2,1);
+			
+			//ok, we have the two parts of the 
+			//escape sequence in c1 and c2
+			if(c1 == 91 && c2 == 65) {
+				//this is the escape for the up arrow
+				//which we want to use for history 
+				//browsing
+				char *tmpLine;
+				tmpLine = prev_history();
+				if(tmpLine != 0) {
+					if(line[0] != '\0' && fromHistory==0) {
+						//store what user currently has typed (if anything)
+						memset(historyHold,0,100);
+						strncpy(historyHold,line,strlen(line)); 
+					}
+					clear_line(strnlen(line)); //clears whatever is at the prompt
+					memset(line,0,100);
+					strncpy(line,tmpLine,strlen(tmpLine)); //copy this command
+					free(tmpLine); //play nice
+					write(1,line,strlen(line)); //write old command
+					fromHistory = 1; //current line has been replaced by history
+					curPos = strlen(line) + promptLen; //so we know where are
+				}
+			}
+			else if(c1 == 91 && c2 == 66) {
+				//this is the escape for the down arrow
+				//which should make us go "forward"
+				//in history (if we are back in it)
+				char *tmpLine;
+				tmpLine = next_history(); //get the next history
+				if(tmpLine != 0) {
+					//next_history gave us a line
+					clear_line(strlen(line)); //clear old line from screen
+					memset(line,0,100); //clear old line in mem
+					strncpy(line,tmpLine,strlen(tmpLine)); //copy new line to old line
+					write(1,line,strlen(line)); //write new line to screen
+					curPos = strlen(line) + promptLen; //update pos
+					free(tmpLine);
+				}
+				else if(historyHold[0] != '\0') {
+					//if we dont have a next_line, lets see if
+					//we had some buffer before browsing history
+					clear_line(strlen(line));
+					memset(line,0,100);					
+					strncpy(line,historyHold,strlen(historyHold));
+					write(1,line,strlen(line));
+					curPos = strlen(line) +promptLen;
+					fromHistory = 0; //back to user typed
+				}
+				else {
+					//it was blank before history was browsed
+					clear_line(strlen(line));
+					memset(line,0,100);
+					curPos = promptLen;
+				}
+			}				
+		}
+		memset(printBuff,0,100); //clear printing buffer
+	}
+	printf("\n"); //for niceness
+	quit_raw_mode(); //so we dont get stuck in it
+	return 0; //goodbye
+}
