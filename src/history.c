@@ -294,7 +294,7 @@ void exec_history(char* cmd)
 		sprintf(tmp2,"%s\n",tmp); //print the command they chose
 		write(1,tmp2,strlen(tmp2));
 		clear_args(); //clear all old arguments
-		parse_args(tmp); //repearse this old command
+		parse_args(tmp); //reparse this old command
 		add_history(tmp); //this is what goes into history
 		execute(args[0]); //arg[0] is the command itself
 		free(tmp);

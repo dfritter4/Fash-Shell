@@ -61,6 +61,7 @@ static void get_path(void);
 static void clear_line(int);
 static void backspace(void);
 static void read_config(void);
+static void process_multiple(void);
 
 /*these are referenced outside this code, so non-static */
 void parse_args(char*);
@@ -415,6 +416,75 @@ int check_builtin(char *cmd)
 	return 0;
 }
 
+int check_separ()
+{
+	/* Arguments:
+			none
+			
+		Purpose:
+			this function checks to see if there are
+			semicolons which indicates a sequence of
+			commands. will call the process_multiple()
+			function if it finds a semicolon
+		
+		Returns:
+			0  -- no semicolons
+			1 -- found semicolon, dealt with sequence
+	*/	
+	int x;
+	for(x=0;x<strlen(line);++x) {
+		if(line[x] == ';') {
+			process_multiple();
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void process_multiple()
+{
+	/* Arguments:
+			none
+			
+		Purpose:
+			this function will split a sequence of commands
+			by semicolon and execute them in order
+			
+	*/	
+	char* list_cmds[20]; //we assume no more than 20 commands
+	char *tmp_cmd = (char *)malloc(sizeof(char)*100);
+	memset(tmp_cmd,0,100);
+	int cmd_num = 0;
+	
+	int x,y=0;
+	for(x=0;x<strlen(line);++x){
+		if(line[x] != ';'){
+			tmp_cmd[y] = line[x];
+			++y;
+		}
+		else {
+			tmp_cmd[y+1] = '\0';
+			list_cmds[cmd_num] = (char *)malloc(sizeof(char)*strlen(tmp_cmd));
+			memset(list_cmds[cmd_num],0,strlen(tmp_cmd));
+			strcpy(list_cmds[cmd_num],tmp_cmd);
+			++cmd_num;
+			y = 0;
+		}
+	}
+	tmp_cmd[y+1] = '\0';
+	list_cmds[cmd_num] = (char *)malloc(sizeof(char)*strlen(tmp_cmd));
+	strcpy(list_cmds[cmd_num],tmp_cmd);
+	memset(tmp_cmd,0,100);
+	for(x=0;x<=cmd_num;++x){
+		parse_args(list_cmds[x]);
+		strcpy(tmp_cmd,args[0]);
+		execute(tmp_cmd);
+		clear_args();
+		free(list_cmds[x]);
+	}	
+	free(tmp_cmd);
+}
+
 void clear_line(int len)
 {
 	/* Arguments:
@@ -529,11 +599,12 @@ int main(int argc, char *argv[], char *envp[])
 						if(line[0] != '!') {
 							add_history(line); //add command to history
 						}						
-						int pipe = 0; //essentially a boolean for pipes/no pipes
+						int pipe = 0, separ = 0; //essentially a boolean for pipes/no pipes
 						pipe = check_pipe(); //before execute since this could potentially call execute
-						if(!pipe){ //try to execute the command if there werent pipes
+						separ = check_separ(); //check for multiple commands
+						if(!pipe && !separ){ //try to execute the command if there werent pipes or semicolons
 							parse_args(line); //build array of arguments
-							strncpy(cmd, args[0], strlen(args[0])); //cmd = program to run
+							strcpy(cmd, args[0]); //cmd = program to run
 							execute(cmd);
 							clear_args(); //resets all arg array strings
 						}
