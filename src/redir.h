@@ -19,6 +19,6 @@
  * inside the function code in redir.c
  */
 void check_redir(void);
-int check_pipe(void);
+int check_pipe(char*);
 void pipe_execute(char*,int);
 #endif

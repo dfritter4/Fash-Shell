@@ -61,6 +61,7 @@ static void get_path(void);
 static void clear_line(int);
 static void backspace(void);
 static void read_config(void);
+static int check_separ(char*);
 static void process_multiple(void);
 
 /*these are referenced outside this code, so non-static */
@@ -416,7 +417,7 @@ int check_builtin(char *cmd)
 	return 0;
 }
 
-int check_separ()
+int check_separ(char *line)
 {
 	/* Arguments:
 			none
@@ -463,10 +464,11 @@ void process_multiple()
 			++y;
 		}
 		else {
-			tmp_cmd[y+1] = '\0';
-			list_cmds[cmd_num] = (char *)malloc(sizeof(char)*strlen(tmp_cmd));
-			memset(list_cmds[cmd_num],0,strlen(tmp_cmd));
+			tmp_cmd[y] = '\0';
+			list_cmds[cmd_num] = (char *)calloc(100,sizeof(char)*strlen(tmp_cmd));
+			//memset(list_cmds[cmd_num],0,strlen(tmp_cmd)+1);
 			strcpy(list_cmds[cmd_num],tmp_cmd);
+			memset(tmp_cmd, 0, 100);
 			++cmd_num;
 			y = 0;
 		}
@@ -476,11 +478,13 @@ void process_multiple()
 	strcpy(list_cmds[cmd_num],tmp_cmd);
 	memset(tmp_cmd,0,100);
 	for(x=0;x<=cmd_num;++x){
-		parse_args(list_cmds[x]);
-		strcpy(tmp_cmd,args[0]);
-		execute(tmp_cmd);
-		clear_args();
-		free(list_cmds[x]);
+		if(!check_pipe(list_cmds[x])){
+			parse_args(list_cmds[x]);
+			strcpy(tmp_cmd,args[0]);
+			execute(tmp_cmd);
+			clear_args();
+			free(list_cmds[x]);
+		}
 	}	
 	free(tmp_cmd);
 }
@@ -598,11 +602,13 @@ int main(int argc, char *argv[], char *envp[])
 						strncat(line,"\0",1);
 						if(line[0] != '!') {
 							add_history(line); //add command to history
-						}						
-						int pipe = 0, separ = 0; //essentially a boolean for pipes/no pipes
-						pipe = check_pipe(); //before execute since this could potentially call execute
-						separ = check_separ(); //check for multiple commands
-						if(!pipe && !separ){ //try to execute the command if there werent pipes or semicolons
+						}	
+						int pipe = 0;
+						int separ = check_separ(line);
+						if(!separ){
+							pipe = check_pipe(line);					
+						}
+						if(!separ && !pipe){ //try to execute the command if there werent pipes or semicolons
 							parse_args(line); //build array of arguments
 							strcpy(cmd, args[0]); //cmd = program to run
 							execute(cmd);
