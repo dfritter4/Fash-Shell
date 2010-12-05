@@ -85,18 +85,59 @@ char* tab_complete(char* line)
 		}
 	} while( dp != NULL);
 	
+	char *tmp = (char*)calloc(0,sizeof(char) * 100);
+	char *tmp2 = (char*)calloc(0,sizeof(char) * 100);
+	char *tmpp = tmp;
 	if(possInd == 1) {
 		//just return that one thing and clear the hold
-		char *tmp = (char*)malloc(sizeof(char) * 100);
-		char *tmp2 = (char*)malloc(sizeof(char) * 100);
-		char *tmpp = tmp;
-		memset(tmp,0,100);
-		memset(tmp2,0,100);
 		strcpy(tmp,tabCompHold[0]);
 		tmp+=strlen(line2); //only the completion part
 		strcpy(tmp2,tmp); //copy this completion part
 		free(tmpp); //free old crap
 		clear_tab_hold(); //clear anything in the hold
+		return tmp2; //return this new completion
+	} else {
+		// multiple matches, continue to build complete line
+		// tabCompHold will have the matches
+		//
+		// for example, lets say the line is 
+		//		$ grep al
+		//
+		// if there are three files that start with "al"
+		//		alias.c alias.h alias.o
+		// 
+		// then we can match up to the "."
+		//
+		// line should then print out
+		//		$ grep alias.
+		tmp[0] = *(tabCompHold[0]);
+		char nextChar = *(tabCompHold[0]+1);
+		int holds = 0;
+		int x=0,y=1;
+		//we can only match up to length of the shortest
+		//string, so we'll go until the end of the first
+		while(nextChar != '\0'){
+			for(x = 1;x<possInd; ++x){
+				if(nextChar == *(tabCompHold[x]+y)){
+					holds = 1;
+				} else {
+					holds = 0;
+					break;
+				}
+			}
+			if(!holds){
+				break;
+			}
+			else{
+				tmp[y] = *(tabCompHold[0]+y);
+			}
+			++y;
+			nextChar = *(tabCompHold[0]+y);
+			holds = 0;
+		}
+		tmp+=strlen(line2); //only the completion part
+		strcpy(tmp2,tmp); //copy this completion part
+		free(tmpp); //free old crap
 		return tmp2; //return this new completion
 	}
 	
