@@ -155,7 +155,7 @@ This can be used for two or more commands. For example,
 # USAGE - Tab completion
 ###########################################
 FASH has some very basic tab completion functionality that is
-unfortunately very limited. 
+somewhat limited. 
 
 FASH tab completion can do two things essentially:
 	1. it can complete any unique match (for things in CWD)
@@ -169,11 +169,14 @@ and then press <TAB> to have FASH complete your line to:
 Lets say that you have 3 files called "emails.txt", "email_bob.txt",
 and "email_from_work.txt" in your CWD, if you type:
 	$ vi ema
-followed by a <TAB>, FASH will find the three files, but it won't know
-which to complete. You can view the files it finds by immediately
+followed by a <TAB>, FASH will find the three files, but will only
+complete up to the first ambiguiuty. So, in this example, Fash will
+print:
+	$ vi email
+You can view all the files it finds by immediately
 pressing <TAB> a second time. Here's what the whole runthrough would
 look like:
-	$ vi ema<TAB><TAB>
+	$ vi ema<TAB>il<TAB>
 	emails.txt	email_bob.txt	email_from_work.txt
 	$ 
 
